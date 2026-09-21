@@ -1,25 +1,59 @@
 @import "tailwindcss";
 
+@theme {
+  /* Vercel light canvas */
+  --color-canvas: #fafafa;
+  --color-surface: #ffffff;
+  --color-surface-hover: #f5f5f5;
+  --color-ink: #0a0a0a;
+  --color-ink-secondary: #525252;
+  --color-ink-tertiary: #8f8f8f;
+  --color-line: #eaeaea;
+  --color-line-strong: #d4d4d4;
+  /* Status / accent (Vercel palette) */
+  --color-vercel-blue: #0070f3;
+  --color-vercel-amber: #f5a623;
+  --color-vercel-red: #ee0000;
+  --color-vercel-green: #50e3c2;
+
+  --font-sans: "Geist", -apple-system, "Helvetica Neue", sans-serif;
+  --font-mono: "Geist Mono", "SF Mono", Menlo, monospace;
+}
+
 @layer base {
   * {
     box-sizing: border-box;
+  }
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-feature-settings: "ss01", "cv01";
   }
 }
 
 /* Custom scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(0, 0, 0, 0.14);
   border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.25);
+  background: rgba(0, 0, 0, 0.28);
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 
 .titlebar-drag {

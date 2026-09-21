@@ -62,6 +62,13 @@ const api = {
       ipcRenderer.removeListener('services:status-changed', handler)
     }
   },
+  onPortDetected: (callback: (data: { serviceId: string }) => void) => {
+    const handler = (_: any, data: any) => callback(data)
+    ipcRenderer.on('services:port-detected', handler)
+    return () => {
+      ipcRenderer.removeListener('services:port-detected', handler)
+    }
+  },
   onWindowResized: (callback: () => void) => {
     const handler = () => callback()
     ipcRenderer.on('window:resized', handler)

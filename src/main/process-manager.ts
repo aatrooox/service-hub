@@ -7,6 +7,10 @@ import { ServiceConfig, ServiceRuntime, ServiceStatus } from './types'
 
 export type LogListener = (serviceId: string, text: string) => void
 export type StatusListener = (serviceId: string, runtime: ServiceRuntime) => void
+export type PortDetectedListener = (
+  serviceId: string,
+  detail: { port: number; webUrl: string }
+) => void
 
 interface ManagedProcess {
   config: ServiceConfig
@@ -14,12 +18,15 @@ interface ManagedProcess {
   runtime: ServiceRuntime
   logs: string[]
   healthCheckTimer?: NodeJS.Timeout
+  portWatchTimer?: NodeJS.Timeout
+  probeFailures: number
 }
 
 export class ProcessManager {
   private processes: Map<string, ManagedProcess> = new Map()
   private logListeners: Set<LogListener> = new Set()
   private statusListeners: Set<StatusListener> = new Set()
+  private portListeners: Set<PortDetectedListener> = new Set()
   private heartbeatTimer?: NodeJS.Timeout
 
   constructor() {
@@ -34,7 +41,8 @@ export class ProcessManager {
           id: config.id,
           status: 'STOPPED'
         },
-        logs: []
+        logs: [],
+        probeFailures: 0
       })
     } else {
       const existing = this.processes.get(config.id)!
@@ -59,8 +67,17 @@ export class ProcessManager {
     return () => this.statusListeners.delete(listener)
   }
 
+  public onPortDetected(listener: PortDetectedListener): () => void {
+    this.portListeners.add(listener)
+    return () => this.portListeners.delete(listener)
+  }
+
   public getRuntime(serviceId: string): ServiceRuntime {
     return this.processes.get(serviceId)?.runtime || { id: serviceId, status: 'STOPPED' }
+  }
+
+  public getConfig(serviceId: string): ServiceConfig | undefined {
+    return this.processes.get(serviceId)?.config
   }
 
   public getAllRuntimes(): Record<string, ServiceRuntime> {
@@ -83,6 +100,10 @@ export class ProcessManager {
   private appendLog(serviceId: string, text: string): void {
     const item = this.processes.get(serviceId)
     if (!item) return
+    // Ensure every line break carries a carriage return for xterm rendering.
+    if (!text.includes('\r\n')) {
+      text = text.replace(/\r?\n/g, '\r\n')
+    }
     if (item.logs.length > 2000) {
       item.logs.splice(0, item.logs.length - 1500)
     }
@@ -90,6 +111,12 @@ export class ProcessManager {
     for (const listener of this.logListeners) {
       listener(serviceId, text)
     }
+  }
+
+  // Programs often emit bare "\n"; xterm only moves down without returning to
+  // column 0, which makes output cascade diagonally. Normalize to "\r\n".
+  private normalizeOutput(data: Buffer): string {
+    return data.toString().replace(/\r?\n/g, '\r\n')
   }
 
   private updateStatus(serviceId: string, patch: Partial<ServiceRuntime>): void {
@@ -115,49 +142,53 @@ export class ProcessManager {
     if (!item) return false
 
     const { config } = item
-    let isAlive = false
-    let detectedPid: number | undefined
+    const hasProbe = !!(config.healthCheck?.endpoint || config.webUrl || config.port)
 
-    // 1. If webUrl or healthCheck endpoint exists, test HTTP ping
-    const probeUrl = config.healthCheck?.endpoint || config.webUrl
-    if (probeUrl) {
-      isAlive = await this.probeHttp(probeUrl)
+    // --- Probe readiness (is the service actually accepting traffic?) ---
+    let ready = false
+    if (config.healthCheck?.endpoint || config.webUrl) {
+      ready = await this.probeHttp(config.healthCheck?.endpoint || config.webUrl!)
+    }
+    if (!ready && config.port) {
+      ready = await this.probeTcp(config.port)
+    }
+    if (!hasProbe) {
+      ready = true
     }
 
-    // 2. If not detected via HTTP, but port exists, test TCP connect
-    if (!isAlive && config.port) {
-      isAlive = await this.probeTcp(config.port)
-    }
+    // --- Liveness (does the managed process / server still exist?) ---
+    const processAlive = !!item.process
+    const alive = hasProbe ? ready || processAlive : processAlive
 
-    // 3. If alive, find listening PID if port exists
-    if (isAlive && config.port) {
-      detectedPid = await this.findPidByPort(config.port)
+    let pid: number | undefined
+    if (ready && config.port) {
+      pid = await this.findPidByPort(config.port)
     }
+    if (item.process?.pid) pid = item.process.pid
 
-    // If active child process exists, prefer its PID
-    if (item.process && item.process.pid) {
-      detectedPid = item.process.pid
-    }
-
-    if (isAlive) {
-      this.updateStatus(serviceId, {
-        status: 'RUNNING',
-        pid: detectedPid,
-        error: undefined
-      })
-      return true
-    } else {
-      // If service is not responding and not starting
-      if (item.runtime.status !== 'STARTING') {
-        if (item.runtime.status === 'RUNNING') {
-          this.updateStatus(serviceId, {
-            status: 'STOPPED',
-            pid: undefined
-          })
-        }
+    // --- Status transition ---
+    if (item.runtime.status === 'STARTING') {
+      // Stay STARTING until the probe actually passes; with no probe, the
+      // spawned process itself counts as ready.
+      if (ready) {
+        item.probeFailures = 0
+        this.updateStatus(serviceId, { status: 'RUNNING', pid, error: undefined })
       }
-      return false
+      return ready
     }
+
+    if (alive) {
+      item.probeFailures = 0
+      this.updateStatus(serviceId, { status: 'RUNNING', pid, error: undefined })
+      return true
+    }
+
+    // Not alive: require a few consecutive failures before flapping to STOPPED.
+    item.probeFailures += 1
+    if (item.probeFailures >= 3) {
+      this.updateStatus(serviceId, { status: 'STOPPED', pid: undefined })
+    }
+    return false
   }
 
   private startHeartbeat(): void {
@@ -184,6 +215,10 @@ export class ProcessManager {
     }
 
     const { config } = item
+
+    // Snapshot listening ports before spawning so we can tell which port
+    // this process actually opened.
+    const prePortMap = await this.getListeningPortMap()
 
     this.updateStatus(serviceId, {
       status: 'STARTING',
@@ -215,11 +250,11 @@ export class ProcessManager {
       this.updateStatus(serviceId, { pid })
 
       child.stdout?.on('data', (data: Buffer) => {
-        this.appendLog(serviceId, data.toString())
+        this.appendLog(serviceId, this.normalizeOutput(data))
       })
 
       child.stderr?.on('data', (data: Buffer) => {
-        this.appendLog(serviceId, data.toString())
+        this.appendLog(serviceId, this.normalizeOutput(data))
       })
 
       child.on('error', (err) => {
@@ -239,6 +274,10 @@ export class ProcessManager {
           clearTimeout(item.healthCheckTimer)
           item.healthCheckTimer = undefined
         }
+        if (item.portWatchTimer) {
+          clearTimeout(item.portWatchTimer)
+          item.portWatchTimer = undefined
+        }
         item.process = undefined
         if (item.runtime.status !== 'STOPPED') {
           this.updateStatus(serviceId, {
@@ -251,6 +290,11 @@ export class ProcessManager {
 
       // Actively poll until it becomes healthy
       this.monitorHealth(serviceId)
+
+      // No declared port: auto-discover the port its process tree opens.
+      if (!config.port) {
+        this.watchForListeningPort(serviceId, pid, new Set(prePortMap.keys()))
+      }
 
       return { success: true }
     } catch (err: any) {
@@ -348,6 +392,114 @@ export class ProcessManager {
     })
   }
 
+  /**
+   * Returns a Map of every locally listening TCP port -> owning PID,
+   * using a single lsof call.
+   */
+  private getListeningPortMap(): Promise<Map<number, number>> {
+    return new Promise((resolve) => {
+      exec('lsof -nP -iTCP -sTCP:LISTEN', (err, stdout) => {
+        const map = new Map<number, number>()
+        if (err || !stdout) return resolve(map)
+        const lines = stdout.split('\n').slice(1)
+        for (const line of lines) {
+          const parts = line.trim().split(/\s+/)
+          if (parts.length < 9) continue
+          const pid = parseInt(parts[1], 10)
+          const addr = parts[8]
+          const match = addr.match(/:(\d+)$/)
+          if (match && !isNaN(pid)) {
+            map.set(parseInt(match[1], 10), pid)
+          }
+        }
+        resolve(map)
+      })
+    })
+  }
+
+  /** Collects the root PID and all its descendant PIDs. */
+  private getProcessTreePids(rootPid: number): Promise<Set<number>> {
+    return new Promise((resolve) => {
+      exec(`pgrep -P ${rootPid}`, (err, stdout) => {
+        const pids = new Set<number>([rootPid])
+        if (err || !stdout.trim()) return resolve(pids)
+        const children = stdout.trim().split('\n').map((p) => parseInt(p, 10)).filter((p) => !isNaN(p))
+        let pending = children.length
+        if (pending === 0) return resolve(pids)
+        for (const child of children) {
+          pids.add(child)
+          this.getProcessTreePids(child).then((desc) => {
+            for (const p of desc) pids.add(p)
+            pending -= 1
+            if (pending === 0) resolve(pids)
+          })
+        }
+      })
+    })
+  }
+
+  /**
+   * For a service without a declared port, polls until its process tree
+   * opens a listening TCP port and auto-fills port + webUrl.
+   */
+  private watchForListeningPort(
+    serviceId: string,
+    rootPid: number,
+    baseline: Set<number>
+  ): void {
+    const item = this.processes.get(serviceId)
+    if (!item) return
+    let elapsed = 0
+    const intervalMs = 700
+    const maxMs = 60000
+
+    const tick = async (): Promise<void> => {
+      if (!item.process || elapsed > maxMs) return
+      const [tree, portMap] = await Promise.all([
+        this.getProcessTreePids(rootPid),
+        this.getListeningPortMap()
+      ])
+
+      const candidates: number[] = []
+      for (const [port, pid] of portMap) {
+        if (tree.has(pid) && !baseline.has(port)) candidates.push(port)
+      }
+      // Prefer common dev-server ports, otherwise the lowest candidate.
+      candidates.sort((a, b) => {
+        const pref = (p: number): number => {
+          if (p >= 5173 && p <= 5199) return 0
+          if (p >= 3000 && p <= 3999) return 1
+          if (p >= 8000 && p <= 8999) return 2
+          return 3
+        }
+        return pref(a) - pref(b) || a - b
+      })
+
+      if (candidates.length > 0) {
+        const port = candidates[0]
+        const webUrl = `http://127.0.0.1:${port}`
+        item.config.port = port
+        item.config.webUrl = webUrl
+        if (!item.config.healthCheck || item.config.healthCheck.type === 'none') {
+          item.config.healthCheck = { type: 'tcp' }
+        }
+        this.appendLog(
+          serviceId,
+          `\x1b[32m[ServiceHub]\x1b[0m 自动嗅探到监听端口 :${port}\n`
+        )
+        for (const listener of this.portListeners) {
+          listener(serviceId, { port, webUrl })
+        }
+        return
+      }
+
+      elapsed += intervalMs
+      item.portWatchTimer = setTimeout(tick, intervalMs)
+    }
+
+    tick()
+  }
+
   public async stop(serviceId: string): Promise<{ success: boolean; error?: string }> {
     const item = this.processes.get(serviceId)
     if (!item) return { success: false, error: 'Service not found' }
@@ -355,6 +507,10 @@ export class ProcessManager {
     if (item.healthCheckTimer) {
       clearTimeout(item.healthCheckTimer)
       item.healthCheckTimer = undefined
+    }
+    if (item.portWatchTimer) {
+      clearTimeout(item.portWatchTimer)
+      item.portWatchTimer = undefined
     }
 
     let pid = item.runtime.pid || item.process?.pid

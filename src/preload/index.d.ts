@@ -34,6 +34,7 @@ export interface IElectronAPI {
 
   onLog: (callback: (data: { serviceId: string; text: string }) => void) => () => void
   onStatus: (callback: (data: { serviceId: string; runtime: ServiceRuntime }) => void) => () => void
+  onPortDetected: (callback: (data: { serviceId: string }) => void) => () => void
   onWindowResized: (callback: () => void) => () => void
 }
 

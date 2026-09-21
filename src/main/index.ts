@@ -66,12 +66,18 @@ function setupIPC(): void {
   })
 
   // 2. Save service
-  ipcMain.handle('services:save', (_, config: ServiceConfig): ServiceItem => {
-    configStore.set(config)
-    processManager.registerService(config)
-    return {
-      ...config,
-      runtime: processManager.getRuntime(config.id)
+  ipcMain.handle('services:save', async (_, config: ServiceConfig): Promise<ServiceItem> => {
+    console.log('[services:save] received:', JSON.stringify(config))
+    try {
+      configStore.set(config)
+      processManager.registerService(config)
+      return {
+        ...config,
+        runtime: processManager.getRuntime(config.id)
+      }
+    } catch (err) {
+      console.error('[services:save] failed:', err)
+      throw err
     }
   })
 
@@ -169,7 +175,13 @@ function setupIPC(): void {
     if (existsSync(manifestPath)) {
       try {
         const raw = readFileSync(manifestPath, 'utf8')
-        return JSON.parse(raw)
+        const manifest = JSON.parse(raw)
+        return {
+          ...manifest,
+          id: manifest.id || folderName.toLowerCase().replace(/[^a-z0-9_-]/g, '-'),
+          name: manifest.name || folderName,
+          cwd: manifest.cwd || folderPath
+        }
       } catch {}
     }
 
@@ -237,6 +249,13 @@ app.whenReady().then(() => {
 
   processManager.onStatus((serviceId, runtime) => {
     mainWindow?.webContents.send('services:status-changed', { serviceId, runtime })
+  })
+
+  processManager.onPortDetected((serviceId) => {
+    // Persist the auto-discovered port so it survives restarts.
+    const updated = processManager.getConfig?.(serviceId)
+    if (updated) configStore.set(updated)
+    mainWindow?.webContents.send('services:port-detected', { serviceId })
   })
 
   setupIPC()
